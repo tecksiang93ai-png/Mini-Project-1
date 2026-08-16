@@ -73,13 +73,13 @@ an optional feature-selection stage, and the artifacts location. The config is v
 | Column | Description | Handling |
 | ------ | ----------- | -------- |
 | `ID`, `URL` | Article identifiers | Dropped |
-| `timedelta` | Days between publication and data acquisition | Numeric feature |
+| `timedelta` | Days between publication and data acquisition | **Dropped** (not known at publish time) |
 | `weekday` | Day of week published | One-hot |
 | `data_channel` | Article topic (world, tech, …); 15% missing | One-hot; missing → `unknown` |
 | `n_tokens_title/content` | Word counts | Numeric |
 | `n_unique_tokens`, `n_non_stop_words`, `n_non_stop_unique_tokens` | Rate features in [0,1] | Range-clipped, numeric |
 | `num_hrefs/self_hrefs/imgs/videos` | Link/media counts (`num_videos` 47% missing) | Median-imputed |
-| `n_comments` | Reader comments | Numeric (see **Limitations**) |
+| `n_comments` | Reader comments (accrue after publication) | **Dropped** (leakage — see **Limitations**) |
 | `kw_*` | Keyword share statistics (min/max/avg families) | Numeric (collinear) |
 | `self_reference_*_shares` | Shares of referenced articles | Numeric |
 | `shares` | **Target** — times the article was shared | `log1p` transformed |
@@ -105,8 +105,9 @@ an optional feature-selection stage, and the artifacts location. The config is v
 
 See `eda.ipynb`. In short: the target needs a log transform; `num_videos` (47%) is missing at
 random (uninformative → median-impute) while missing `data_channel` is informative (kept as
-`unknown`); weekend articles are shared more; every predictor is weak (top: `n_comments` r≈0.33,
-`kw_avg_avg` r≈0.22); the `kw_*` and `self_reference_*` families are strongly collinear.
+`unknown`); weekend articles are shared more; every predictor is weak (the strongest correlate,
+`n_comments` r≈0.33, is excluded as a post-publication leak — among pre-publication features
+`kw_avg_avg` r≈0.22 leads); the `kw_*` and `self_reference_*` families are strongly collinear.
 
 ---
 
@@ -127,21 +128,31 @@ for a stability read). Selection is on **validation log-scale R²**.
 
 ### Results
 
-| Model | CV R²(log) | Test R²(log) | Test MAE (shares) |
-| ----- | ---------- | ------------ | ----------------- |
-| **HistGradientBoosting** | **0.454 ± 0.006** | **0.46** | **~1,761** |
-| RandomForest | 0.448 ± 0.006 | 0.43 | ~1,803 |
-| Ridge / Lasso / Linear | 0.124 ± 0.13 | 0.21 | ~2,170 |
-| Dummy (baseline) | 0.000 | 0.00 | ~2,367 |
+This is a **pre-publication** model: `n_comments` and `timedelta` are excluded as
+post-publication signals (see **Limitations**). Only the selected model is scored on the
+held-out test set; the others show cross-validation and validation figures.
+
+| Model | CV R²(log) | Val R²(log) | Val MAE (shares) |
+| ----- | ---------- | ----------- | ---------------- |
+| **HistGradientBoosting** ⭐ | **0.158 ± 0.007** | **0.154** | **~2,248** |
+| RandomForest | 0.153 ± 0.004 | 0.145 | ~2,262 |
+| Ridge / Lasso / Linear | 0.119 ± 0.002 | 0.099 | ~2,298 |
+| Dummy (baseline) | 0.000 | 0.000 | ~2,367 |
+
+**Selected model on the held-out test set:** HistGradientBoosting — **R²(log) 0.16, MAE ~2,296
+shares**.
 
 **Which model is most suitable, and why.** **HistGradientBoosting** is selected. It has the best
-and most *stable* cross-validated log-R² (0.454, std 0.006), edges out RandomForest, and clearly
-beats the linear models (0.21) and the Dummy baseline (0.00). The large gap from linear to tree
-models shows the signal is non-linear and interaction-heavy; the small Dummy R² confirms the
-task is genuinely hard, so a ~0.45 log-R² is a strong result here. HistGradientBoosting is also
-the practical choice — it trains far faster than RandomForest on this row count at equal
-accuracy. Raw-scale R²/RMSE are reported for completeness but are unstable (viral outliers), so
-**MAE (~1,761 shares)** is the interpretable original-scale figure.
+and most *stable* cross-validated log-R² (0.158, std 0.007), edges out RandomForest, and beats
+the linear models (0.099) and the Dummy baseline (0.000). The gap from linear to tree models
+shows the (weak) signal is non-linear; the ~0 Dummy R² confirms the task is genuinely hard, so a
+~0.16 log-R² from *pre-publication* features alone is a reasonable result. HistGradientBoosting
+is also the practical choice — it trains far faster than RandomForest at equal accuracy.
+Raw-scale R²/RMSE are unstable (viral outliers), so **MAE (~2,296 shares)** is the interpretable
+original-scale figure.
+
+> For context, including `n_comments` lifts the best test R²(log) to ~0.46 — but that leaks
+> post-publication engagement, so it is deliberately excluded here (see Limitations).
 
 ---
 
@@ -149,18 +160,18 @@ accuracy. Raw-scale R²/RMSE are reported for completeness but are unstable (vir
 
 **Limitations**
 
-* **`n_comments` is a concurrent engagement signal.** Reader comments accrue *after* publication,
-  like shares, and are measured at the same acquisition time — so including `n_comments` as a
-  predictor arguably leaks post-publication popularity. It is kept here because the brief provides
-  it as an attribute, but for a strictly *pre-publication* forecast it should be dropped; expect a
-  lower (but more honest) R² if so.
-* Even with tree models, most of the variance in `shares` is unexplained — popularity is partly
-  driven by external factors (timing, promotion, luck) absent from the data.
+* **This is a pre-publication forecast.** `n_comments` (reader comments accrue *after*
+  publication, like shares) and `timedelta` (the article's age at scrape time) are both excluded,
+  because neither is knowable when an article is published — including them leaks post-publication
+  information. Including `n_comments` would raise test R²(log) from ~0.16 to ~0.46, which
+  quantifies exactly how much of the apparent accuracy was leakage.
+* Most of the variance in `shares` is genuinely unexplained — popularity is driven substantially
+  by external factors (timing, promotion, luck) absent from the data, so a modest R² is expected.
 * Raw-scale error metrics are dominated by a few viral articles; the log scale is the reliable lens.
 
 **Next steps**
 
-* Train a pre-publication variant without `n_comments` (and other post-hoc signals) and compare.
 * Try target/impact encoding for `data_channel`, and engineer an explicit `is_weekend` feature.
-* Add SHAP-based feature importance to explain the selected model, and consider framing an
-  alternative "viral vs not" classification target.
+* Add SHAP-based feature importance to explain the selected model.
+* Consider reframing as a "viral vs not" classification target, which is often more tractable for
+  this dataset than point-predicting a heavy-tailed count.

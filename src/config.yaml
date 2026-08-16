@@ -28,9 +28,12 @@ rate_features:
   - n_non_stop_words
   - n_non_stop_unique_tokens
 
-# Feature settings
+# Feature settings.
+# NOTE: `n_comments` (reader comments accrue AFTER publication) and `timedelta`
+# (the article's age at data-acquisition time) are deliberately EXCLUDED — neither
+# is knowable at publication, so including them would leak post-publication
+# information into a popularity forecast. See README "Limitations".
 numerical_features:
-  - timedelta
   - n_tokens_title
   - n_tokens_content
   - n_unique_tokens
@@ -40,7 +43,6 @@ numerical_features:
   - num_self_hrefs
   - num_imgs
   - num_videos
-  - n_comments
   - average_token_length
   - self_reference_min_shares
   - self_reference_max_shares
