@@ -1,0 +1,119 @@
+# ============================================================================
+# Configuration for the Online News Popularity regression pipeline.
+# Everything the pipeline needs is declared here so nothing is hard-coded in the
+# Python modules. main.py validates this file on load.
+# ============================================================================
+
+# Data settings
+file_path: ./data/data.csv
+target_column: shares
+
+# Reproducibility — one seed used for splitting AND every stochastic model.
+random_seed: 42
+
+# Target transform. `shares` is extremely right-skewed (skew ~34), so we model
+# log1p(shares) and inverse-transform predictions back to the shares scale.
+# Metrics are reported on BOTH scales (see model selection below).
+log_transform_target: true
+
+# Columns dropped before modelling (identifiers with no predictive value).
+drop_columns:
+  - ID
+  - URL
+
+# Rate features that are bounded in [0, 1] by definition; values outside that
+# range are corrupt and set to NaN (then imputed).
+rate_features:
+  - n_unique_tokens
+  - n_non_stop_words
+  - n_non_stop_unique_tokens
+
+# Feature settings
+numerical_features:
+  - timedelta
+  - n_tokens_title
+  - n_tokens_content
+  - n_unique_tokens
+  - n_non_stop_words
+  - n_non_stop_unique_tokens
+  - num_hrefs
+  - num_self_hrefs
+  - num_imgs
+  - num_videos
+  - n_comments
+  - average_token_length
+  - self_reference_min_shares
+  - self_reference_max_shares
+  - self_reference_avg_shares
+  - num_keywords
+  - kw_min_min
+  - kw_max_min
+  - kw_avg_min
+  - kw_min_max
+  - kw_max_max
+  - kw_avg_max
+  - kw_min_avg
+  - kw_max_avg
+  - kw_avg_avg
+categorical_features:
+  - weekday
+  - data_channel
+
+# Preprocessing (all inside the sklearn pipeline, fit on training data only).
+numeric_imputer_strategy: median
+categorical_imputer_strategy: constant   # missing category -> its own label
+categorical_fill_value: unknown
+
+# Data splitting: 80% train / 10% validation / 10% test.
+val_test_size: 0.2
+val_size: 0.5
+
+# Model selection (on the validation set). Metrics are computed on the original
+# shares scale (MAE/MSE/RMSE/R2) AND the log scale (…_log). Because raw-scale R2
+# is dominated by a handful of viral outliers, we select on log-scale R2, which
+# is the more stable and meaningful criterion for this skewed target.
+selection_metric: R2_log
+selection_mode: max
+selection_tiebreak: RMSE_log
+
+# Cross-validation used by the tuning search (scored on the log target).
+cv: 3
+scoring: r2
+
+# Models to train and (optionally) tune. Empty grid => fit with defaults, which
+# is how the DummyRegressor baseline and the plain linear model run.
+models:
+  dummy:
+    estimator: DummyRegressor
+    grid: {}
+  linear_regression:
+    estimator: LinearRegression
+    grid: {}
+  ridge:
+    estimator: Ridge
+    grid:
+      regressor__alpha: [0.1, 1.0, 10.0, 100.0]
+  lasso:
+    estimator: Lasso
+    grid:
+      regressor__alpha: [0.0001, 0.001, 0.01, 0.1]
+  random_forest:
+    estimator: RandomForestRegressor
+    grid:
+      regressor__n_estimators: [300]
+      regressor__max_depth: [12, 20]
+      regressor__min_samples_leaf: [5]
+  gradient_boosting:
+    estimator: HistGradientBoostingRegressor
+    grid:
+      regressor__max_iter: [300, 500]
+      regressor__learning_rate: [0.05, 0.1]
+
+# Optional feature-selection stage inside the pipeline (off by default).
+feature_selection:
+  enabled: false
+  method: variance_threshold
+  threshold: 0.0
+
+# Where trained artifacts are written.
+artifacts_dir: ./artifacts
