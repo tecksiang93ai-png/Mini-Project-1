@@ -1,7 +1,29 @@
+"""
+model_training.py
+=================
+
+Training, tuning, selection, evaluation, and artifact persistence for the Online
+News Popularity regression task.
+
+The set of models, their grids, the selection policy, an optional feature-selection
+stage, and the output location all come from ``config``. Models are trained on the
+(log-)target and scored on both the original shares scale and the log scale.
+
+Public API
+----------
+* ``ModelTraining.split_data``        -> train/val/test split
+* ``ModelTraining.train_and_tune``    -> per-model fitted pipeline + metrics
+* ``ModelTraining.select_best``       -> winning model name (deterministic)
+* ``ModelTraining.refit_on_train_val``-> winner refit on train+val
+* ``ModelTraining.evaluate``          -> dual-scale metric dict
+* ``ModelTraining.save_artifacts``    -> persist model, preprocessor, split, manifest
+"""
+
 # Standard library imports
 import json
 import logging
 import platform
+import uuid
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -199,7 +221,15 @@ class ModelTraining:
         return model
 
     def evaluate(self, model, X, y, label: str) -> Dict[str, float]:
-        """Metrics on the original shares scale and on the log-target scale."""
+        """Metrics on the original shares scale and on the log-target scale.
+
+        Raises ValueError on empty input or fewer than two samples, since R² is
+        undefined without variance across at least two observations.
+        """
+        if len(X) < 2:
+            raise ValueError(
+                f"evaluate('{label}') needs >= 2 samples for R2; got {len(X)}."
+            )
         pred_m = model.predict(X)
         y_m = self._to_model_space(y)
         pred = self._to_shares(pred_m)
@@ -218,59 +248,89 @@ class ModelTraining:
         )
         return metrics
 
-    def save_artifacts(self, best_name, final_model, results, final_metrics, X_test, y_test) -> str:
-        """Persist the fitted pipeline, a model-comparison table (with fold-level
-        CV mean/std), test predictions, runtime package versions, and a run
-        manifest. Files use both stable names (for inference) and run-versioned
-        names (so experiments don't overwrite). Returns the run id."""
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # ------------------------------------------------------------------ #
+    # Artifact persistence (split into focused helpers)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _new_run_id() -> str:
+        """Timestamp + short random suffix, so two runs in the same second don't
+        collide on artifact filenames."""
+        return f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
+
+    def _package_versions(self) -> Dict[str, str]:
+        env = {pkg: _safe_version(pkg) for pkg in _TRACKED_PACKAGES}
+        env["python"] = platform.python_version()
+        return env
+
+    def _save_models(self, out, best_name, final_model, run_id) -> None:
+        # Full pipeline (stable + versioned) and the standalone fitted preprocessor.
+        joblib.dump(final_model, out / "best_model.joblib")
+        joblib.dump(final_model, out / f"best_model_{best_name}_{run_id}.joblib")
+        joblib.dump(final_model.named_steps["preprocessor"], out / "preprocessor.joblib")
+
+    def _save_comparison(self, out, results, run_id) -> None:
+        rows = []
+        for name, r in results.items():
+            row = {"model": name}
+            row.update({f"val_{k}": v for k, v in r["val_metrics"].items()})
+            row["cv_mean"] = r["cv_mean"]
+            row["cv_std"] = r["cv_std"]
+            rows.append(row)
+        comparison = pd.DataFrame(rows).sort_values("val_R2_log", ascending=False)
+        comparison.to_csv(out / "model_comparison.csv", index=False)
+        comparison.to_csv(out / f"model_comparison_{run_id}.csv", index=False)
+
+    def _save_predictions(self, out, final_model, X_test, y_test) -> None:
+        pd.DataFrame(
+            {"y_true": y_test.to_numpy(), "y_pred": self._to_shares(final_model.predict(X_test))}
+        ).to_csv(out / "test_predictions.csv", index=False)
+
+    def _save_split_indices(self, out, X_train, X_val, X_test) -> None:
+        # Record the exact row assignment so the partition can be reproduced/inspected.
+        frames = [pd.DataFrame({"row_index": idx.to_numpy(), "split": name})
+                  for idx, name in ((X_train.index, "train"),
+                                    (X_val.index, "validation"),
+                                    (X_test.index, "test"))]
+        pd.concat(frames, ignore_index=True).to_csv(out / "split_indices.csv", index=False)
+
+    def _save_manifest(self, out, best_name, results, final_metrics, run_id, env) -> None:
+        manifest = {
+            "run_id": run_id,
+            "best_model": best_name,
+            "best_params": results[best_name]["best_params"],
+            "log_transform_target": self.log,
+            "selection_metric": self.config["selection_metric"],
+            "selection_mode": self.config["selection_mode"],
+            "best_cv_mean": results[best_name]["cv_mean"],
+            "best_cv_std": results[best_name]["cv_std"],
+            "final_test_metrics": final_metrics,
+            "random_seed": self.seed,
+            "package_versions": env,
+            "config_snapshot": self.config,
+        }
+        payload = json.dumps(manifest, indent=2, default=str)
+        for fname in ("run_manifest.json", f"run_manifest_{run_id}.json"):
+            (out / fname).write_text(payload, encoding="utf-8")
+
+    def save_artifacts(self, best_name, final_model, results, final_metrics,
+                       X_train, X_val, X_test, y_test) -> str:
+        """Persist all run artifacts and return the run id. Writes: the fitted
+        pipeline (stable + versioned) and standalone preprocessor, the model
+        comparison table (with fold-level CV mean/std), test predictions, the exact
+        split row indices, the runtime package versions, and a run manifest."""
+        run_id = self._new_run_id()
         out = Path(self.config["artifacts_dir"])
         try:
             out.mkdir(parents=True, exist_ok=True)
-
-            joblib.dump(final_model, out / "best_model.joblib")
-            joblib.dump(final_model, out / f"best_model_{best_name}_{run_id}.joblib")
-
-            rows = []
-            for name, r in results.items():
-                row = {"model": name}
-                row.update({f"val_{k}": v for k, v in r["val_metrics"].items()})
-                row["cv_mean"] = r["cv_mean"]
-                row["cv_std"] = r["cv_std"]
-                rows.append(row)
-            comparison = pd.DataFrame(rows).sort_values("val_R2_log", ascending=False)
-            comparison.to_csv(out / "model_comparison.csv", index=False)
-            comparison.to_csv(out / f"model_comparison_{run_id}.csv", index=False)
-
-            pd.DataFrame(
-                {"y_true": y_test.to_numpy(),
-                 "y_pred": self._to_shares(final_model.predict(X_test))}
-            ).to_csv(out / "test_predictions.csv", index=False)
-
-            env = {pkg: _safe_version(pkg) for pkg in _TRACKED_PACKAGES}
-            env["python"] = platform.python_version()
+            env = self._package_versions()
+            self._save_models(out, best_name, final_model, run_id)
+            self._save_comparison(out, results, run_id)
+            self._save_predictions(out, final_model, X_test, y_test)
+            self._save_split_indices(out, X_train, X_val, X_test)
             (out / "environment.txt").write_text(
                 "\n".join(f"{k}=={v}" for k, v in env.items()) + "\n", encoding="utf-8"
             )
-
-            manifest = {
-                "run_id": run_id,
-                "best_model": best_name,
-                "best_params": results[best_name]["best_params"],
-                "log_transform_target": self.log,
-                "selection_metric": self.config["selection_metric"],
-                "selection_mode": self.config["selection_mode"],
-                "best_cv_mean": results[best_name]["cv_mean"],
-                "best_cv_std": results[best_name]["cv_std"],
-                "final_test_metrics": final_metrics,
-                "random_seed": self.seed,
-                "package_versions": env,
-                "config_snapshot": self.config,
-            }
-            for fname in ("run_manifest.json", f"run_manifest_{run_id}.json"):
-                (out / fname).write_text(
-                    json.dumps(manifest, indent=2, default=str), encoding="utf-8"
-                )
+            self._save_manifest(out, best_name, results, final_metrics, run_id, env)
         except OSError as exc:
             logging.error("Failed to write artifacts to %s: %s", out, exc)
             raise

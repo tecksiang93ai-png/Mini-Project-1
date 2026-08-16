@@ -1,7 +1,9 @@
 """Tests for the model-training layer: log-target, factory, leakage, selection, artifacts."""
 import copy
+import json
 
 import numpy as np
+import pandas as pd
 import pytest
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
@@ -28,8 +30,36 @@ def trained(trainer_and_data):
 
 def test_make_pipeline_unknown_estimator_raises(fast_config):
     trainer = ModelTraining(fast_config, DataPreparation(fast_config).preprocessor)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Unknown estimator"):
         trainer._make_pipeline("NotAModel")
+
+
+def test_feature_selection_stage_is_inserted(fast_config):
+    """When feature_selection is enabled in config, the pipeline gains a selector."""
+    cfg = copy.deepcopy(fast_config)
+    cfg["feature_selection"] = {"enabled": True, "method": "variance_threshold", "threshold": 0.0}
+    trainer = ModelTraining(cfg, DataPreparation(cfg).preprocessor)
+    steps = dict(trainer._make_pipeline("Ridge").named_steps)
+    assert "selector" in steps
+
+
+def test_feature_selection_pipeline_trains(fast_config, raw_df):
+    """The feature-selection branch runs end to end without error."""
+    cfg = copy.deepcopy(fast_config)
+    cfg["feature_selection"] = {"enabled": True, "method": "variance_threshold", "threshold": 0.0}
+    prep = DataPreparation(cfg)
+    clean = prep.clean_data(raw_df.copy())
+    trainer = ModelTraining(cfg, prep.preprocessor)
+    X_train, X_val, X_test, y_train, y_val, y_test = trainer.split_data(clean)
+    results = trainer.train_and_tune(X_train, y_train, X_val, y_val)
+    assert set(results) == set(cfg["models"])
+
+
+def test_evaluate_raises_on_too_small_input(trained):
+    trainer, (X_train, X_val, X_test, y_train, y_val, y_test), results = trained
+    best = trainer.select_best(results)
+    with pytest.raises(ValueError, match=">= 2 samples"):
+        trainer.evaluate(results[best]["pipeline"], X_test.head(1), y_test.head(1), "tiny")
 
 
 def test_make_pipeline_seeds_stochastic_model(fast_config):
@@ -86,7 +116,7 @@ def test_refit_on_train_val_predicts_nonnegative_shares(trained):
     assert (preds >= 0).all()   # shares can never be negative
 
 
-def test_save_artifacts_writes_expected_files(fast_config, raw_df, tmp_path):
+def test_save_artifacts_writes_and_populates_files(fast_config, raw_df, tmp_path):
     cfg = copy.deepcopy(fast_config)
     cfg["artifacts_dir"] = str(tmp_path)
     prep = DataPreparation(cfg)
@@ -97,7 +127,22 @@ def test_save_artifacts_writes_expected_files(fast_config, raw_df, tmp_path):
     best = trainer.select_best(results)
     final = trainer.refit_on_train_val(results[best]["pipeline"], X_train, X_val, y_train, y_val)
     metrics = trainer.evaluate(final, X_test, y_test, "test")
-    trainer.save_artifacts(best, final, results, metrics, X_test, y_test)
-    for fname in ("best_model.joblib", "model_comparison.csv", "test_predictions.csv",
-                  "run_manifest.json", "environment.txt"):
+    trainer.save_artifacts(best, final, results, metrics, X_train, X_val, X_test, y_test)
+
+    # Files exist, including the standalone preprocessor and split indices.
+    for fname in ("best_model.joblib", "preprocessor.joblib", "model_comparison.csv",
+                  "test_predictions.csv", "split_indices.csv", "run_manifest.json",
+                  "environment.txt"):
         assert (tmp_path / fname).is_file(), f"missing artifact: {fname}"
+
+    # Contents are correct, not just present.
+    manifest = json.loads((tmp_path / "run_manifest.json").read_text())
+    assert manifest["best_model"] == best
+    assert manifest["final_test_metrics"]["R2_log"] == pytest.approx(metrics["R2_log"])
+
+    comparison = pd.read_csv(tmp_path / "model_comparison.csv")
+    assert set(comparison["model"]) == set(cfg["models"])
+
+    splits = pd.read_csv(tmp_path / "split_indices.csv")
+    assert set(splits["split"].unique()) == {"train", "validation", "test"}
+    assert len(splits) == len(clean)   # every row assigned exactly once

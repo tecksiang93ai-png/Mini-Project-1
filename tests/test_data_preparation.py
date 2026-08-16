@@ -5,7 +5,12 @@ import pytest
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from src.data_preparation import DataPreparation, load_config, load_data
+from src.data_preparation import (
+    DataPreparation,
+    _validate_config_schema,
+    load_config,
+    load_data,
+)
 
 
 def _branch(preprocessor, name):
@@ -92,20 +97,38 @@ def test_load_config_valid(config):
 
 
 def test_load_config_missing_file_raises():
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError, match="Config file not found"):
         load_config("./src/nope.yaml")
 
 
 def test_load_config_missing_key_raises(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("target_column: shares\n", encoding="utf-8")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="missing required key"):
         load_config(str(bad))
+
+
+def test_config_schema_rejects_bad_type(config):
+    bad = dict(config, cv=2.5)  # float where an int is required
+    with pytest.raises(ValueError, match="cv"):
+        _validate_config_schema(bad)
+
+
+def test_config_schema_rejects_out_of_range(config):
+    bad = dict(config, val_test_size=1.5)  # must be a fraction in (0, 1)
+    with pytest.raises(ValueError, match="val_test_size"):
+        _validate_config_schema(bad)
+
+
+def test_config_schema_rejects_malformed_model(config):
+    bad = dict(config, models={"oops": {"grid": {}}})  # missing 'estimator'
+    with pytest.raises(ValueError, match="estimator"):
+        _validate_config_schema(bad)
 
 
 def test_load_data_missing_column_raises(config, tmp_path):
     incomplete = tmp_path / "data.csv"
     pd.DataFrame({"shares": [1.0, 2.0]}).to_csv(incomplete, index=False)
     cfg = dict(config, file_path=str(incomplete))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="missing expected column"):
         load_data(cfg)

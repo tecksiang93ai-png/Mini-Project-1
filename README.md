@@ -25,11 +25,13 @@ outliers.
 │   ├── config.yaml             # all pipeline settings (no hard-coded values)
 │   ├── data_preparation.py     # config/data loaders, cleaning, preprocessor
 │   └── model_training.py       # model factory, tuning, selection, evaluation, artifacts
-├── tests/                      # pytest suite (cleaning, preprocessing, training)
+├── tests/                      # pytest suite (cleaning, preprocessing, training, integration)
+├── scripts/                    # check_env.py (env gate), compare_runs.py (run comparison)
 ├── reports/                    # persisted EDA summaries (correlations, outliers, VIF)
 ├── eda.ipynb                   # exploratory data analysis
-├── main.py                     # end-to-end pipeline entry point
+├── main.py                     # end-to-end pipeline entry point (train / predict)
 ├── requirements.txt            # pinned dependencies
+├── pyproject.toml              # Ruff lint/format config
 └── README.md
 ```
 
@@ -52,15 +54,48 @@ Dependencies are version-pinned in `requirements.txt` for reproducibility.
 ## Usage
 
 ```bash
-python main.py                                   # train, compare, select, evaluate
-python main.py --config ./src/config.yaml --log-level DEBUG
-python -m pytest tests/ -q                       # run the test suite
+# Train, compare, select the best model, evaluate on test, and save artifacts:
+python main.py                       # (train is the default command)
+python main.py train --log-level DEBUG
+
+# Score new articles (same raw schema) with the saved model:
+python main.py predict --input data/new_articles.csv --output predictions.csv
+
+# Tooling:
+python -m pytest tests/ -q           # run the test suite
+python scripts/check_env.py          # verify installed versions match requirements.txt
+python scripts/compare_runs.py       # summarise all saved runs into one table
+ruff check .                         # lint (config in pyproject.toml)
 ```
 
 Training validates the config, loads and cleans the data, trains + tunes every configured model
 on the log target, selects the best on validation (deterministic tie-break), refits it on
-train+validation, evaluates once on the held-out test set, and writes artifacts to `./artifacts/`
-(stable + run-versioned names, plus `environment.txt` capturing package versions).
+train+validation, evaluates once on the held-out test set, and writes artifacts to `./artifacts/`.
+Every run also appends to `artifacts/run.log`.
+
+### Loading the saved model for inference
+
+```python
+import joblib, numpy as np, pandas as pd
+from src.data_preparation import DataPreparation, load_config
+
+config = load_config("./src/config.yaml")
+model = joblib.load("artifacts/best_model.joblib")           # fitted Pipeline
+new = pd.read_csv("data/new_articles.csv")                   # raw schema
+X = DataPreparation(config).clean_data(new).drop(columns=[config["target_column"]], errors="ignore")
+pred_log = model.predict(X)                                  # model outputs log1p(shares)
+shares = np.clip(np.expm1(pred_log), 0, None)                # inverse-transform to shares
+```
+
+(The `python main.py predict` command does exactly this end to end.)
+
+### Artifacts written per run
+
+`best_model.joblib` (stable) + `best_model_<model>_<runid>.joblib` (versioned), the standalone
+`preprocessor.joblib`, `model_comparison.csv` (with fold-level CV mean/std), `test_predictions.csv`,
+`split_indices.csv` (exact train/val/test row assignment), `environment.txt` (package versions),
+and `run_manifest.json` (best model, params, metrics, seed, config snapshot). Run ids combine a
+timestamp with a short random suffix to stay collision-resistant.
 
 All behaviour is driven by `./src/config.yaml`: seed, target transform, feature lists,
 imputation strategies, split ratios, the models and their grids, the selection metric/tie-break,
