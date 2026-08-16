@@ -23,6 +23,7 @@ Public API
 import json
 import logging
 import platform
+import shutil
 import uuid
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -154,35 +155,78 @@ class ModelTraining:
         steps.append(("regressor", model))
         return Pipeline(steps=steps)
 
+    def assert_no_leakage(self, X_train, y_train) -> None:
+        """Runtime leakage guard (fail-fast), run on every training run so the
+        safeguard is visible in logs — not only enforced by architecture/tests.
+
+        1. Fails if any configured feature is on the excluded post-publication list.
+        2. Warns if any numeric feature is suspiciously correlated with the target.
+        """
+        leak = self.config.get("leakage") or {}
+        excluded = set(leak.get("excluded_features", []))
+        configured = set(self.config["numerical_features"]) | set(self.config["categorical_features"])
+        reintroduced = sorted(excluded & configured)
+        if reintroduced:
+            raise ValueError(
+                "Leakage guard: excluded post-publication feature(s) present in the "
+                f"model feature lists: {reintroduced}. Remove them from config."
+            )
+        threshold = leak.get("correlation_warn_threshold", 0.9)
+        y_m = self._to_model_space(y_train)
+        numeric = [c for c in self.config["numerical_features"] if c in X_train.columns]
+        for col in numeric:
+            r = X_train[col].corr(y_m)
+            if pd.notna(r) and abs(r) > threshold:
+                logging.warning(
+                    "Leakage guard: feature '%s' has |corr|=%.2f with the target (> %.2f) "
+                    "— verify it is knowable at prediction time.", col, abs(r), threshold,
+                )
+        logging.info(
+            "Leakage guard passed: %d excluded feature(s) absent from %d configured "
+            "features; scanned %d numeric features for suspicious correlation.",
+            len(excluded), len(configured), len(numeric),
+        )
+
+    def _fit_one(self, name, spec, X_train, y_train_m, cv, scoring):
+        """Fit (and optionally tune) a single model; returns fitted pipeline, best
+        params, and the CV mean/std on the log target."""
+        grid = spec.get("grid") or {}
+        pipeline = self._make_pipeline(spec["estimator"])
+        if grid:
+            logging.info("Tuning %s over %d-fold CV ...", name, cv)
+            search = GridSearchCV(pipeline, grid, cv=cv, scoring=scoring, n_jobs=-1)
+            search.fit(X_train, y_train_m)
+            bi = search.best_index_
+            return (search.best_estimator_, search.best_params_,
+                    float(search.cv_results_["mean_test_score"][bi]),
+                    float(search.cv_results_["std_test_score"][bi]))
+        logging.info("Fitting %s (no tuning) ...", name)
+        scores = cross_val_score(pipeline, X_train, y_train_m, cv=cv, scoring=scoring, n_jobs=-1)
+        pipeline.fit(X_train, y_train_m)
+        return pipeline, {}, float(scores.mean()), float(scores.std())
+
     def train_and_tune(self, X_train, y_train, X_val, y_val) -> Dict[str, Dict[str, Any]]:
         """Fit every configured model on the (log-)target. Models with a grid are
         tuned by cross-validated search; the rest are fit with defaults but still
-        cross-validated for fold-level reporting. Each is evaluated on validation."""
+        cross-validated for fold-level reporting. Each is evaluated on validation.
+
+        Each model is isolated: if one fails (e.g. a bad grid), it is logged and
+        skipped so the remaining candidates are still evaluated."""
         cv = self.config.get("cv", 5)
         scoring = self.config.get("scoring", "r2")
         y_train_m = self._to_model_space(y_train)
+        logging.info(
+            "Preprocessing is fit on the TRAINING split only (inside each pipeline); "
+            "validation/test are transform-only."
+        )
         results: Dict[str, Dict[str, Any]] = {}
         for name, spec in self.config["models"].items():
-            grid = spec.get("grid") or {}
-            pipeline = self._make_pipeline(spec["estimator"])
-            if grid:
-                logging.info("Tuning %s over %d-fold CV ...", name, cv)
-                search = GridSearchCV(pipeline, grid, cv=cv, scoring=scoring, n_jobs=-1)
-                search.fit(X_train, y_train_m)
-                fitted = search.best_estimator_
-                best_params = search.best_params_
-                bi = search.best_index_
-                cv_mean = float(search.cv_results_["mean_test_score"][bi])
-                cv_std = float(search.cv_results_["std_test_score"][bi])
-            else:
-                logging.info("Fitting %s (no tuning) ...", name)
-                scores = cross_val_score(
-                    pipeline, X_train, y_train_m, cv=cv, scoring=scoring, n_jobs=-1
-                )
-                cv_mean, cv_std = float(scores.mean()), float(scores.std())
-                pipeline.fit(X_train, y_train_m)
-                fitted = pipeline
-                best_params = {}
+            try:
+                fitted, best_params, cv_mean, cv_std = self._fit_one(
+                    name, spec, X_train, y_train_m, cv, scoring)
+            except Exception as exc:  # noqa: BLE001 - isolate a bad model, keep the rest
+                logging.error("Model '%s' failed and is skipped: %s", name, exc)
+                continue
             logging.info("  %s CV %s (log target) = %.4f +/- %.4f", name, scoring, cv_mean, cv_std)
             results[name] = {
                 "pipeline": fitted,
@@ -191,6 +235,8 @@ class ModelTraining:
                 "cv_mean": cv_mean,
                 "cv_std": cv_std,
             }
+        if not results:
+            raise RuntimeError("All configured models failed during training.")
         return results
 
     def select_best(self, results: Dict[str, Dict[str, Any]]) -> str:
@@ -263,12 +309,15 @@ class ModelTraining:
         return env
 
     def _save_models(self, out, best_name, final_model, run_id) -> None:
-        # Full pipeline (stable + versioned) and the standalone fitted preprocessor.
-        joblib.dump(final_model, out / "best_model.joblib")
-        joblib.dump(final_model, out / f"best_model_{best_name}_{run_id}.joblib")
+        # Serialize the pipeline once, then copy to the versioned name (cheaper than
+        # dumping twice). Also save the standalone fitted preprocessor.
+        stable = out / "best_model.joblib"
+        joblib.dump(final_model, stable)
+        shutil.copyfile(stable, out / f"best_model_{best_name}_{run_id}.joblib")
         joblib.dump(final_model.named_steps["preprocessor"], out / "preprocessor.joblib")
 
     def _save_comparison(self, out, results, run_id) -> None:
+        """Write the per-model metric table (with fold-level CV mean/std), stable + versioned."""
         rows = []
         for name, r in results.items():
             row = {"model": name}
@@ -281,6 +330,7 @@ class ModelTraining:
         comparison.to_csv(out / f"model_comparison_{run_id}.csv", index=False)
 
     def _save_predictions(self, out, final_model, X_test, y_test) -> None:
+        """Write the held-out test set's true vs predicted shares."""
         pd.DataFrame(
             {"y_true": y_test.to_numpy(), "y_pred": self._to_shares(final_model.predict(X_test))}
         ).to_csv(out / "test_predictions.csv", index=False)
@@ -294,6 +344,7 @@ class ModelTraining:
         pd.concat(frames, ignore_index=True).to_csv(out / "split_indices.csv", index=False)
 
     def _save_manifest(self, out, best_name, results, final_metrics, run_id, env) -> None:
+        """Write the run manifest (best model, params, metrics, seed, env, config), stable + versioned."""
         manifest = {
             "run_id": run_id,
             "best_model": best_name,

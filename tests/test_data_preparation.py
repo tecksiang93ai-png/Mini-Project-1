@@ -46,6 +46,13 @@ def test_clean_keeps_target(config, raw_df):
     assert config["target_column"] in clean.columns
 
 
+def test_clean_data_without_dedup_keeps_all_rows(config, raw_df):
+    # raw_df has an appended exact duplicate; deduplicate=False keeps every row
+    # (the inference path relies on this so predictions stay 1:1 with input).
+    clean = DataPreparation(config).clean_data(raw_df.copy(), deduplicate=False)
+    assert len(clean) == len(raw_df)
+
+
 # --------------------------------------------------------------------------- #
 # Preprocessor
 # --------------------------------------------------------------------------- #
@@ -131,4 +138,16 @@ def test_load_data_missing_column_raises(config, tmp_path):
     pd.DataFrame({"shares": [1.0, 2.0]}).to_csv(incomplete, index=False)
     cfg = dict(config, file_path=str(incomplete))
     with pytest.raises(ValueError, match="missing expected column"):
+        load_data(cfg)
+
+
+def test_load_data_non_numeric_target_raises(config, tmp_path):
+    bad = tmp_path / "data.csv"
+    frame = {c: [0.0, 1.0] for c in config["numerical_features"]}
+    for c in config["categorical_features"]:
+        frame[c] = ["x", "y"]
+    frame[config["target_column"]] = ["a", "b"]  # non-numeric target
+    pd.DataFrame(frame).to_csv(bad, index=False)
+    cfg = dict(config, file_path=str(bad))
+    with pytest.raises(ValueError, match="must be numeric"):
         load_data(cfg)

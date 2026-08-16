@@ -3,6 +3,7 @@ import copy
 from pathlib import Path
 
 import pandas as pd
+import pytest
 import yaml
 
 import main as main_module
@@ -51,3 +52,28 @@ def test_predict_end_to_end(config, raw_df, tmp_path):
     assert pred_col in result.columns
     assert len(result) == len(raw_df)
     assert (result[pred_col] >= 0).all()   # shares predictions are non-negative
+
+
+def test_predict_without_trained_model_raises(config, raw_df, tmp_path):
+    cfg, cfg_path, data_csv = _write_fast_project(config, raw_df, tmp_path)
+    # No training has run, so no saved model exists.
+    with pytest.raises(FileNotFoundError, match="Trained model not found"):
+        main_module.predict(str(cfg_path), str(data_csv), str(tmp_path / "out.csv"))
+
+
+def test_predict_missing_columns_raises(config, raw_df, tmp_path):
+    cfg, cfg_path, data_csv = _write_fast_project(config, raw_df, tmp_path)
+    main_module.train(str(cfg_path))
+    bad_input = tmp_path / "bad_input.csv"
+    pd.DataFrame({"weekday": ["monday", "tuesday"]}).to_csv(bad_input, index=False)
+    with pytest.raises(ValueError, match="missing required column"):
+        main_module.predict(str(cfg_path), str(bad_input), str(tmp_path / "out.csv"))
+
+
+def test_train_missing_data_file_raises(config, tmp_path):
+    cfg = copy.deepcopy(config)
+    cfg["file_path"] = str(tmp_path / "does_not_exist.csv")
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="Data file not found"):
+        main_module.train(str(cfg_path))

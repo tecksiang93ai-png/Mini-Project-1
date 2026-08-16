@@ -111,6 +111,18 @@ models:
       regressor__max_iter: [300, 500]
       regressor__learning_rate: [0.05, 0.1]
 
+# Runtime leakage guards, asserted at the start of every training run (not just in
+# tests) so the safeguard is visible in logs and hard to undo by accident.
+leakage:
+  # Post-publication / not-knowable-at-prediction features that must NEVER appear in
+  # the model feature lists. Training fails fast if any are re-added.
+  excluded_features:
+    - n_comments
+    - timedelta
+  # Warn if any numeric feature correlates with the (log) target above this — a
+  # feature "too predictive" to be trustworthy deserves a second look.
+  correlation_warn_threshold: 0.9
+
 # Optional feature-selection stage inside the pipeline (off by default).
 feature_selection:
   enabled: false

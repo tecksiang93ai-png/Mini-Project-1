@@ -1,18 +1,18 @@
-"""Shared pytest fixtures for the news-popularity test suite."""
+"""Shared pytest fixtures for the news-popularity test suite.
+
+The project root is put on the import path via ``pythonpath = ["."]`` in
+pyproject.toml, so ``from src...`` / ``import main`` work without sys.path hacks.
+"""
 import copy
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from src.data_preparation import load_config
+
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from src.data_preparation import load_config  # noqa: E402
-
 CONFIG_PATH = ROOT / "src" / "config.yaml"
 
 

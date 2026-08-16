@@ -62,6 +62,32 @@ def test_evaluate_raises_on_too_small_input(trained):
         trainer.evaluate(results[best]["pipeline"], X_test.head(1), y_test.head(1), "tiny")
 
 
+def test_unknown_feature_selection_method_raises(fast_config):
+    cfg = copy.deepcopy(fast_config)
+    cfg["feature_selection"] = {"enabled": True, "method": "bogus"}
+    trainer = ModelTraining(cfg, DataPreparation(cfg).preprocessor)
+    with pytest.raises(ValueError, match="feature_selection.method"):
+        trainer._make_pipeline("Ridge")
+
+
+def test_assert_no_leakage_passes(fast_config, raw_df):
+    prep = DataPreparation(fast_config)
+    clean = prep.clean_data(raw_df.copy())
+    trainer = ModelTraining(fast_config, prep.preprocessor)
+    X_train, X_val, X_test, y_train, y_val, y_test = trainer.split_data(clean)
+    trainer.assert_no_leakage(X_train, y_train)   # must not raise
+
+
+def test_assert_no_leakage_raises_when_excluded_feature_reintroduced(fast_config):
+    cfg = copy.deepcopy(fast_config)
+    cfg["numerical_features"] = cfg["numerical_features"] + ["n_comments"]
+    cfg["leakage"] = {"excluded_features": ["n_comments", "timedelta"]}
+    trainer = ModelTraining(cfg, DataPreparation(fast_config).preprocessor)
+    # The config-list check fires before any data is touched.
+    with pytest.raises(ValueError, match="excluded post-publication"):
+        trainer.assert_no_leakage(pd.DataFrame(), pd.Series(dtype=float))
+
+
 def test_make_pipeline_seeds_stochastic_model(fast_config):
     trainer = ModelTraining(fast_config, DataPreparation(fast_config).preprocessor)
     rf = trainer._make_pipeline("RandomForestRegressor").named_steps["regressor"]

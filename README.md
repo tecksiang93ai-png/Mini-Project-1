@@ -128,10 +128,15 @@ an optional feature-selection stage, and the artifacts location. The config is v
 3. **Preprocessing** (inside a `ColumnTransformer`/`Pipeline`, fit on training data only):
    median-impute + scale numerics; constant-impute (`unknown`) + one-hot encode categoricals.
 4. **Split** 80/10/10 train/validation/test, seeded.
-5. **Train + tune** each model on `log1p(shares)` (grid search where a grid is given).
-6. **Select** the best by validation log-scale R² (tie-break: log-scale RMSE, then name).
-7. **Refit** the winner on train+val, **evaluate once** on the test set.
-8. **Persist** the model, a comparison table (with fold-level CV mean/std), predictions, and a
+5. **Runtime leakage guard** — before training, assert that no excluded post-publication feature
+   (`n_comments`, `timedelta`, configurable under `leakage`) has crept into the feature lists, and
+   warn on any feature suspiciously correlated with the target. This makes the safeguard visible in
+   logs and hard to undo by accident, not just enforced by architecture/tests.
+6. **Train + tune** each model on `log1p(shares)` (grid search where a grid is given). Each model is
+   isolated — a failure is logged and skipped so the rest still run.
+7. **Select** the best by validation log-scale R² (tie-break: log-scale RMSE, then name).
+8. **Refit** the winner on train+val, **evaluate once** on the test set.
+9. **Persist** the model, a comparison table (with fold-level CV mean/std), predictions, and a
    run manifest.
 
 ---

@@ -37,13 +37,21 @@ def set_global_seed(seed: int) -> None:
 
 
 def _add_file_logging(artifacts_dir: str) -> None:
-    """Persist logs alongside the run artifacts (in addition to the console)."""
-    out = Path(artifacts_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(out / "run.log", encoding="utf-8")
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S"))
-    logging.getLogger().addHandler(handler)
+    """Persist logs alongside the run artifacts (in addition to the console).
+
+    A file-system problem (e.g. a read-only directory) degrades to console-only
+    logging with a warning rather than aborting the run.
+    """
+    try:
+        out = Path(artifacts_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(out / "run.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S"))
+        logging.getLogger().addHandler(handler)
+    except OSError as exc:
+        logging.warning("Could not set up file logging in %s (%s); console only.",
+                        artifacts_dir, exc)
 
 
 def train(config_path: str) -> str:
@@ -73,6 +81,7 @@ def train(config_path: str) -> str:
     trainer = ModelTraining(config, data_prep.preprocessor)
     X_train, X_val, X_test, y_train, y_val, y_test = trainer.split_data(cleaned_df)
 
+    trainer.assert_no_leakage(X_train, y_train)   # fail fast if a leak feature crept in
     results = trainer.train_and_tune(X_train, y_train, X_val, y_val)
     best_name = trainer.select_best(results)
 
@@ -118,16 +127,17 @@ def predict(config_path: str, input_csv: str, output_csv: str) -> pd.DataFrame:
     pred = model.predict(cleaned)
     if config["log_transform_target"]:
         pred = np.clip(np.expm1(pred), 0, None)
-    result = raw.copy()
-    result["predicted_" + config["target_column"]] = pred
+    # Write predictions onto the input frame directly (no redundant copy).
+    raw["predicted_" + config["target_column"]] = pred
 
     Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(output_csv, index=False)
-    logging.info("Wrote %d predictions to %s", len(result), Path(output_csv).resolve())
-    return result
+    raw.to_csv(output_csv, index=False)
+    logging.info("Wrote %d predictions to %s", len(raw), Path(output_csv).resolve())
+    return raw
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the `train` (default) and `predict` subcommands."""
     # Shared options so `--log-level`/`--config` work at the top level and on each
     # subcommand (e.g. `python main.py train --log-level DEBUG`).
     common = argparse.ArgumentParser(add_help=False)
@@ -152,6 +162,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """CLI entry point: configure logging, then dispatch to train or predict."""
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),

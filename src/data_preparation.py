@@ -177,9 +177,17 @@ class DataPreparation:
         if deduplicate:
             df = df.drop_duplicates()
 
+        coerced = 0
         for col in self.config.get("rate_features", []):
             if col in df.columns:
+                out_of_range = ~df[col].between(0.0, 1.0) & df[col].notna()
+                coerced += int(out_of_range.sum())
                 df[col] = df[col].where(df[col].between(0.0, 1.0), np.nan)
+        if coerced:
+            logging.info(
+                "Cleaning coerced %d out-of-range rate value(s) to NaN (for imputation).",
+                coerced,
+            )
 
         df = df.reset_index(drop=True)
         logging.info("Cleaned data: %d rows x %d columns.", *df.shape)
